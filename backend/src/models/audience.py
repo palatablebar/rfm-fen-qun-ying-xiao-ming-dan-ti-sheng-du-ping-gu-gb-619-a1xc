@@ -24,7 +24,12 @@ class Audience(Base):
     inc_gmv: Mapped[float] = mapped_column(Float, default=0.0)
     roi: Mapped[float] = mapped_column(Float, default=0.0)
     global_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    # 生成时固定的正式口径批次号：后续重算不得改动本名单与导出明细
+    batch_no: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     allocation: Mapped[list] = mapped_column(JSON, default=list)
+    # 生成时冻结的会员级明细（分组配额展开后的完整名单），导出只读这份
+    members: Mapped[list] = mapped_column(JSON, default=list)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     operator_email: Mapped[str] = mapped_column(String(160), default="system")
     confirmed_by: Mapped[str | None] = mapped_column(String(160), nullable=True)

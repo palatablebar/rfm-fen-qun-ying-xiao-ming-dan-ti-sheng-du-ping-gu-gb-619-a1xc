@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from src.constants.enums import AUDIENCE_STATUS_LABELS, CAMPAIGN_STATUS_LABELS
 from src.models.audience import Audience
 from src.models.campaign import Campaign
-from src.services import lift_service, segment_service
+from src.services import lift_service, rfm_batch_service, segment_service
 from src.utils.errors import AppError, not_found
 from src.utils.timeutil import iso_date, iso_utc, local_now, utcnow
 
@@ -77,22 +77,27 @@ def _parse_date(text: str | None):
         raise AppError("VALIDATION", 422, {"reason": "日期格式应为 YYYY-MM-DD", "value": text}) from None
 
 
-def preview_allocation(db: Session, campaign: Campaign, budget: float | None = None) -> dict:
-    """算法 B 预览：读当前分群快照 + 活动参数，算出预算分配（不落库）。"""
-    segments = segment_service.segments_for_allocation(db)
+def preview_allocation(db: Session, campaign: Campaign, budget: float | None = None, *, batch=None) -> dict:
+    """算法 B 预览：读正式批次（或线上快照）+ 活动参数，算出预算分配（不落库）。"""
+    active = batch or rfm_batch_service.active_batch(db)
+    segments = segment_service.segments_for_allocation(db, active) if active else segment_service.segments_for_allocation(db)
     if not segments:
         raise AppError("VALIDATION", 409, {"reason": "还没有分群快照，请先重算 RFM"})
     meta = segment_service.list_segments(db)
+    global_rate = (
+        float(active.global_purchase_rate or 0.0) if active is not None else (meta.get("global_purchase_rate") or None)
+    )
     result = lift_service.allocate(
         segments,
         budget=float(budget if budget is not None else campaign.budget),
-        global_rate=meta.get("global_purchase_rate") or None,
+        global_rate=global_rate,
         reach_cost=campaign.reach_cost,
         orders_per_converter=campaign.orders_per_converter,
         tail_factor=campaign.tail_factor,
     )
     result["campaign"] = serialize_campaign(campaign)
-    result["as_of"] = meta.get("as_of")
+    result["as_of"] = active.as_of.isoformat() if active is not None and active.as_of else meta.get("as_of")
+    result["batch_no"] = active.batch_no if active is not None else None
     result["segments_basis"] = [
         {
             "code": item["code"],
@@ -125,9 +130,46 @@ def generate(
         existing = db.scalar(select(Audience).where(Audience.seed_key == seed_key))
         if existing is not None:
             return existing
-    allocation = preview_allocation(db, campaign, budget)
+    active = rfm_batch_service.active_batch(db)
+    allocation = preview_allocation(db, campaign, budget, batch=active)
     if not allocation["totals"]["audience"]:
         raise AppError("VALIDATION", 409, {"reason": "当前预算下没有可分群可投，请提高预算或调整券面额"})
+    # 从生成时的正式批次取会员明细并冻结到名单，后续重算不改动这份导出
+    frozen_members = []
+    if active is not None:
+        for row in allocation["segments"]:
+            if row.get("status") != "allocated" or not row.get("allocated"):
+                continue
+            for member in rfm_batch_service.available_members(
+                db, active, row["segment_code"], int(row["allocated"])
+            ):
+                frozen_members.append(
+                    {
+                        "member_id": member.member_id,
+                        "member_no": member.member_no,
+                        "name": member.name,
+                        "phone": member.phone,
+                        "city": member.city,
+                        "tier": member.tier,
+                        "segment_code": row["segment_code"],
+                        "r_score": member.r_score,
+                        "f_score": member.f_score,
+                        "m_score": member.m_score,
+                        "composite_score": member.composite_score,
+                        "purchase_rate": round(member.purchase_rate or 0.0, 6),
+                    }
+                )
+        if len(frozen_members) != int(allocation["totals"]["audience"]):
+            raise AppError(
+                "CONFLICT",
+                409,
+                {
+                    "reason": "正式批次会员明细与配额不一致，请先核对批次后重试",
+                    "batch_no": active.batch_no,
+                    "allocation": allocation["totals"]["audience"],
+                    "frozen": len(frozen_members),
+                },
+            )
     audience = Audience(
         audience_no=_next_audience_no(db),
         campaign_id=campaign.id,
@@ -139,7 +181,10 @@ def generate(
         inc_gmv=allocation["totals"]["inc_gmv"],
         roi=allocation["totals"]["roi"],
         global_rate=allocation["global_rate"],
+        batch_no=active.batch_no if active is not None else None,
+        batch_id=active.id if active is not None else None,
         allocation=allocation["segments"],
+        members=frozen_members,
         note=note or allocation["log"],
         operator_email=operator_email,
         seed_key=seed_key,
@@ -166,6 +211,7 @@ def serialize_audience(audience: Audience, campaign: Campaign | None = None) -> 
         "inc_gmv": round(audience.inc_gmv or 0.0, 2),
         "roi": round(audience.roi or 0.0, 2),
         "global_rate": round(audience.global_rate or 0.0, 6),
+        "batch_no": audience.batch_no,
         "allocation": audience.allocation or [],
         "note": audience.note,
         "operator_email": audience.operator_email,

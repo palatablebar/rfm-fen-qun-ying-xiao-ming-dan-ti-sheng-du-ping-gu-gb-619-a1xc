@@ -107,7 +107,11 @@ CREATE TABLE audiences (
     inc_gmv         DOUBLE PRECISION NOT NULL DEFAULT 0,
     roi             DOUBLE PRECISION NOT NULL DEFAULT 0,
     global_rate     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- 生成时固定的正式口径批次号；导出只读 members 冻结明细
+    batch_no        VARCHAR(40),
+    batch_id        INTEGER,
     allocation      JSON,
+    members         JSON,
     note            TEXT,
     operator_email  VARCHAR(160) NOT NULL,
     confirmed_by    VARCHAR(160),
@@ -115,6 +119,81 @@ CREATE TABLE audiences (
     seed_key        VARCHAR(120) UNIQUE,
     created_at      TIMESTAMP NOT NULL,
     updated_at      TIMESTAMP NOT NULL
+);
+CREATE INDEX ix_audiences_batch_no ON audiences (batch_no);
+
+-- ---- RFM 重算批次：候选结果与线上口径解耦 ----
+CREATE TABLE rfm_batches (
+    id                  SERIAL PRIMARY KEY,
+    batch_no            VARCHAR(40) NOT NULL UNIQUE,
+    fingerprint         VARCHAR(64) NOT NULL UNIQUE,
+    status              VARCHAR(16) NOT NULL DEFAULT 'running',
+    stage               VARCHAR(16) NOT NULL DEFAULT 'collect',
+    as_of               DATE        NOT NULL,
+    window_days         INTEGER     NOT NULL DEFAULT 365,
+    weights             JSON,
+    order_count         INTEGER     NOT NULL DEFAULT 0,
+    order_max_id        INTEGER,
+    order_max_paid_at   TIMESTAMP,
+    thresholds          JSON,
+    global_purchase_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+    member_count        INTEGER     NOT NULL DEFAULT 0,
+    orders_total        INTEGER     NOT NULL DEFAULT 0,
+    amount_total        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    raw_cursor          INTEGER     NOT NULL DEFAULT 0,
+    score_cursor        INTEGER     NOT NULL DEFAULT 0,
+    processed_members   INTEGER     NOT NULL DEFAULT 0,
+    error               TEXT,
+    trigger             VARCHAR(16) NOT NULL DEFAULT 'manual',
+    created_by          VARCHAR(160) NOT NULL,
+    note                TEXT,
+    switched_from       VARCHAR(40),
+    activated_at        TIMESTAMP,
+    activated_by        VARCHAR(160),
+    created_at          TIMESTAMP   NOT NULL,
+    updated_at          TIMESTAMP   NOT NULL
+);
+
+CREATE TABLE rfm_batch_segments (
+    id              SERIAL PRIMARY KEY,
+    batch_id        INTEGER NOT NULL REFERENCES rfm_batches(id) ON DELETE CASCADE,
+    code            VARCHAR(20) NOT NULL,
+    name            VARCHAR(40) NOT NULL,
+    rule_text       VARCHAR(120) NOT NULL,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    member_count    INTEGER NOT NULL DEFAULT 0,
+    share           DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_r_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_f_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_m_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_r_days      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_amount_window DOUBLE PRECISION NOT NULL DEFAULT 0,
+    purchase_rate   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_ticket      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lift            DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (batch_id, code)
+);
+
+CREATE TABLE rfm_batch_members (
+    id              SERIAL PRIMARY KEY,
+    batch_id        INTEGER NOT NULL REFERENCES rfm_batches(id) ON DELETE CASCADE,
+    member_id       INTEGER NOT NULL,
+    member_no       VARCHAR(24),
+    name            VARCHAR(40),
+    phone           VARCHAR(20),
+    city            VARCHAR(24),
+    tier            VARCHAR(12),
+    r_days          INTEGER NOT NULL DEFAULT 0,
+    orders          INTEGER NOT NULL DEFAULT 0,
+    amount          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    r_score         INTEGER,
+    f_score         INTEGER,
+    m_score         INTEGER,
+    composite_score DOUBLE PRECISION,
+    segment_code    VARCHAR(20),
+    purchase_rate   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_ticket      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (batch_id, member_id)
 );
 
 CREATE TABLE audit_logs (

@@ -101,6 +101,13 @@ export const ENUMS = {
     deferred: '预算不足',
     ineligible: 'lift≤1 不投',
   },
+  batchStatus: {
+    running: '重算中',
+    failed: '失败可续跑',
+    ready: '候选待切换',
+    active: '正式口径',
+    superseded: '已被替换',
+  },
   windowDays: [
     { value: 90, label: '近 90 天' },
     { value: 180, label: '近 180 天' },
@@ -128,6 +135,16 @@ export function segmentTone(code) {
 
 export function audienceTone(status) {
   return { pending: 'pending warn', confirmed: 'ok', pushed: 'info' }[status] || 'info';
+}
+
+export function batchTone(status) {
+  return {
+    running: 'info',
+    failed: 'danger',
+    ready: 'pending warn',
+    active: 'ok',
+    superseded: '',
+  }[status] || '';
 }
 
 export function liftTone(lift) {

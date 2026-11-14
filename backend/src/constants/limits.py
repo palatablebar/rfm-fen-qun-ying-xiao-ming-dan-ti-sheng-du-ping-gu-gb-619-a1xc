@@ -21,3 +21,13 @@ DEFAULT_ORDERS_PER_CONVERTER = 1.4   # 每个增量转化会员在活动窗口�
 DEFAULT_CORE_SHARE = 0.6             # 分群内「高响应核心盘」占比
 DEFAULT_TAIL_FACTOR = 0.6            # 超出核心盘部分的边际折减系数
 LIFT_ELIGIBLE_MIN = 1.0              # lift ≤ 1 不投放
+
+# ---- RFM 重算批次 ----
+BATCH_CHUNK_SIZE = 500               # 批次写入/回写单批行数（游标按此推进）
+BATCH_STATUS_LABELS = {
+    "running": "重算中",
+    "failed": "失败可续跑",
+    "ready": "候选待切换",
+    "active": "正式口径",
+    "superseded": "已被新批次替换",
+}

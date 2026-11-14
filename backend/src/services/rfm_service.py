@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from src.constants.enums import (
@@ -39,10 +38,7 @@ from src.constants.limits import (
     SCORE_SPLIT,
     WEIGHT_SUM_TOLERANCE,
 )
-from src.models.member import Member
-from src.models.segment import Segment
 from src.utils.errors import AppError
-from src.utils.timeutil import utcnow
 
 
 def validate_weights(weights: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -109,6 +105,11 @@ def _recency_days(last_order_on: date | None, as_of: date) -> int:
     return max(0, (as_of - last_order_on).days)
 
 
+def recency_days(last_order_on: date | None, as_of: date) -> int:
+    """公开别名：批次重算与直接计算共用同一 R 口径。"""
+    return _recency_days(last_order_on, as_of)
+
+
 def compute(
     members: list[dict],
     *,
@@ -142,7 +143,6 @@ def compute(
     thresholds_m = percentiles(money)
 
     scored: list[dict] = []
-    groups: dict[str, list[dict]] = {code: [] for code in SEGMENT_ORDER}
     for index, item in enumerate(members):
         r_score = score_of(recency[index], thresholds_r, reverse=True)
         f_score = score_of(freq[index], thresholds_f)
@@ -164,10 +164,42 @@ def compute(
             "avg_ticket": round(float(item.get("avg_ticket") or 0.0), 2),
         }
         scored.append(row)
-        groups[code].append(row)
 
+    aggregate_result = aggregate(scored, weights=weights, window_days=window_days)
+    return {
+        "as_of": as_of.isoformat(),
+        "window_days": window_days,
+        "weights": list(weights),
+        "buckets": RFM_BUCKETS,
+        "thresholds": {
+            "r": [round(item, 2) for item in thresholds_r],
+            "f": [round(item, 2) for item in thresholds_f],
+            "m": [round(item, 2) for item in thresholds_m],
+        },
+        "members": scored,
+        **aggregate_result,
+        "status": "success",
+    }
+
+
+def aggregate(scored: list[dict], *, weights: tuple[float, float, float], window_days: int) -> dict:
+    """由已打分的会员明细汇总八类分群、大盘购买率与口径说明。
+
+    `compute()` 与批次重算（`rfm_batch_service`）共用这一段，
+    保证候选批次与直接计算得到的人数 / 购买率逐位一致。
+    """
     total_members = len(scored)
+    if total_members == 0:
+        return {
+            "global_purchase_rate": 0.0,
+            "segments": _empty_segments(),
+            "totals": {"members": 0, "orders": 0, "amount": 0.0},
+            "log": "没有可评分的会员，未生成分群",
+        }
     global_rate = round(sum(row["purchase_rate"] for row in scored) / total_members, 6)
+    groups: dict[str, list[dict]] = {code: [] for code in SEGMENT_ORDER}
+    for row in scored:
+        groups[row["segment_code"]].append(row)
     segments = []
     for code in SEGMENT_ORDER:
         bucket = groups[code]
@@ -201,11 +233,10 @@ def compute(
                 "lift": lift,
             }
         )
-
     totals = {
         "members": total_members,
-        "orders": sum(freq),
-        "amount": round(sum(money), 2),
+        "orders": sum(int(row["orders"] or 0) for row in scored),
+        "amount": round(sum(float(row["amount"] or 0.0) for row in scored), 2),
     }
     top = max(segments, key=lambda item: (item["lift"], item["member_count"]))
     log = (
@@ -213,20 +244,9 @@ def compute(
         f"最高提升度 {top['name']} lift {top['lift']:.2f}（{top['member_count']} 人）"
     )
     return {
-        "as_of": as_of.isoformat(),
-        "window_days": window_days,
-        "weights": list(weights),
-        "buckets": RFM_BUCKETS,
-        "thresholds": {
-            "r": [round(item, 2) for item in thresholds_r],
-            "f": [round(item, 2) for item in thresholds_f],
-            "m": [round(item, 2) for item in thresholds_m],
-        },
         "global_purchase_rate": global_rate,
-        "members": scored,
         "segments": segments,
         "totals": totals,
-        "status": "success",
         "log": log,
     }
 
@@ -251,63 +271,6 @@ def _empty_segments() -> list[dict]:
         }
         for code in SEGMENT_ORDER
     ]
-
-
-def persist(db: Session, result: dict, *, window_days: int, as_of: date, snapshot: dict | None = None) -> None:
-    """把评分写回会员表，并 upsert 8 个分群快照（不动运营改过的券口径）。"""
-    scored = result.get("members") or []
-    if scored:
-        now = utcnow()
-        payload = []
-        for row in scored:
-            if row.get("id") is None:
-                continue
-            last_order = None
-            if row["r_days"] < NO_ORDER_RECENCY_DAYS:
-                last_order = datetime.combine(as_of - timedelta(days=int(row["r_days"])), datetime.min.time())
-            payload.append(
-                {
-                    "id": row["id"],
-                    "r_days": row["r_days"],
-                    "orders_window": row["orders"],
-                    "amount_window": row["amount"],
-                    "r_score": row["r_score"],
-                    "f_score": row["f_score"],
-                    "m_score": row["m_score"],
-                    "composite_score": row["composite_score"],
-                    "segment_code": row["segment_code"],
-                    "scored_at": now,
-                    "last_order_at": last_order,
-                }
-            )
-        for offset in range(0, len(payload), 1000):
-            db.execute(update(Member), payload[offset : offset + 1000])
-
-    as_of_dt = datetime.combine(as_of, datetime.min.time())
-    for row in result.get("segments") or []:
-        from sqlalchemy import select
-
-        segment = db.scalar(select(Segment).where(Segment.code == row["code"]))
-        if segment is None:
-            segment = Segment(code=row["code"], name=row["name"], sort_order=row["sort_order"])
-            db.add(segment)
-        segment.name = row["name"]
-        segment.rule_text = row["rule_text"]
-        segment.sort_order = row["sort_order"]
-        segment.member_count = row["member_count"]
-        segment.share = row["share"]
-        segment.avg_r_score = row["avg_r_score"]
-        segment.avg_f_score = row["avg_f_score"]
-        segment.avg_m_score = row["avg_m_score"]
-        segment.avg_r_days = row["avg_r_days"]
-        segment.avg_amount_window = row["avg_amount_window"]
-        segment.purchase_rate = row["purchase_rate"]
-        segment.avg_ticket = row["avg_ticket"]
-        segment.lift = row["lift"]
-        segment.as_of = as_of_dt
-        if snapshot is not None:
-            segment.snapshot = snapshot
-    db.flush()
 
 
 def as_of_from_orders(db: Session) -> date:

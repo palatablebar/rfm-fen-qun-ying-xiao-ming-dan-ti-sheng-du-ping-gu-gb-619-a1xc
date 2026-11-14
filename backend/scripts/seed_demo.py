@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import random
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 
 from sqlalchemy import func, insert, select
 
@@ -24,7 +24,7 @@ from src.models.member import Member
 from src.models.order import Order
 from src.models.segment import Segment
 from src.models.user import User
-from src.services import audience_service, segment_service
+from src.services import audience_service, rfm_batch_service, segment_service
 from src.constants.limits import RFM_WINDOW_DAYS
 from src.utils.security import hash_password
 
@@ -222,13 +222,18 @@ def ensure_members_and_orders(db) -> tuple[int, int]:
 
 def ensure_segments(db) -> int:
     if db.scalar(select(func.count()).select_from(Segment)) == 0:
-        segment_service.recompute(db)
+        batch = segment_service.recompute(db)
+        # 初始化批次直接切换为正式口径（重算本身只产候选批次）
+        segment_service.activate_batch(db, batch["id"], actor="seed@rfmseg.io")
         for code, config in SEGMENT_COUPON.items():
             segment = db.scalar(select(Segment).where(Segment.code == code))
             if segment is not None:
                 segment.coupon_face = config["coupon_face"]
                 segment.core_share = config["core_share"]
         db.flush()
+    elif rfm_batch_service.active_batch(db) is None:
+        # 已有分群快照但没有正式批次（老库）：按当前快照参数补一个正式批次
+        rfm_batch_service.ensure_initial(db, actor="seed@rfmseg.io")
     return db.scalar(select(func.count()).select_from(Segment)) or 0
 
 

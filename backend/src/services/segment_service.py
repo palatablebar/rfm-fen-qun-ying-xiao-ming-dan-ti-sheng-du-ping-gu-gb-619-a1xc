@@ -1,18 +1,16 @@
-"""分群快照：读取、参数调整、触发算法 A 重算。"""
+"""分群快照：读取、参数调整、触发算法 A 重算批次。"""
 from __future__ import annotations
-
-from datetime import datetime, time, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src.constants.enums import SEGMENT_LABELS, SEGMENT_ORDER, SEGMENT_RULES
-from src.constants.limits import DEFAULT_RFM_WEIGHTS, DEFAULT_TAIL_FACTOR, RFM_WINDOW_DAYS
+from src.constants.limits import DEFAULT_RFM_WEIGHTS, RFM_WINDOW_DAYS
 from src.models.member import Member
-from src.models.order import Order
+from src.models.rfm_batch import RfmBatch
 from src.models.segment import Segment
-from src.services import rfm_service
-from src.utils.errors import AppError, not_found
+from src.services import rfm_batch_service
+from src.utils.errors import not_found
 from src.utils.timeutil import iso_utc
 
 
@@ -50,11 +48,18 @@ def list_segments(db: Session) -> dict:
             break
     as_of = next((iso_utc(row.as_of) for row in rows if row.as_of), None)
     members_total = db.scalar(select(func.count()).select_from(Member)) or 0
+    active = rfm_batch_service.active_batch(db)
+    pending = db.scalar(
+        select(func.count()).select_from(RfmBatch).where(RfmBatch.status == "ready")
+    ) or 0
     return {
         "items": [serialize(row) for row in rows],
         "members_total": members_total,
         "as_of": as_of,
         "snapshot": snapshot,
+        "batch_no": snapshot.get("batch_no") or (active.batch_no if active else None),
+        "active_batch_no": active.batch_no if active else None,
+        "pending_batches": pending,
         "global_purchase_rate": snapshot.get("global_purchase_rate", 0.0),
         "weights": snapshot.get("weights", list(DEFAULT_RFM_WEIGHTS)),
         "window_days": snapshot.get("window_days", RFM_WINDOW_DAYS),
@@ -80,70 +85,65 @@ def update_segment(db: Session, segment: Segment, payload: dict) -> Segment:
     return segment
 
 
-def _aggregates(db: Session, as_of, window_days: int) -> dict[int, tuple[int, float, datetime | None]]:
-    since = as_of - timedelta(days=window_days)
-    rows = db.execute(
-        select(
-            Order.member_id,
-            func.count(Order.id),
-            func.sum(Order.amount),
-            func.max(Order.paid_at),
-        )
-        .where(Order.paid_at >= datetime.combine(since, time.min))
-        .where(Order.paid_at <= datetime.combine(as_of, time.max))
-        .group_by(Order.member_id)
-    ).all()
-    return {row[0]: (int(row[1] or 0), float(row[2] or 0.0), row[3]) for row in rows}
-
-
 def recompute(
     db: Session,
     *,
     weights: tuple[float, float, float] = DEFAULT_RFM_WEIGHTS,
     window_days: int = RFM_WINDOW_DAYS,
+    trigger: str = "manual",
+    actor: str = "system",
+    note: str | None = None,
 ) -> dict:
-    """从订单事实重算 R/F/M → 打分 → 分群 → 写回会员与 8 行分群快照。"""
-    weights = rfm_service.validate_weights(tuple(weights))
-    if window_days < 30 or window_days > 730:
-        raise AppError("VALIDATION", 422, {"reason": "统计窗口必须在 30~730 天之间"})
-    as_of = rfm_service.as_of_from_orders(db)
-    aggregates = _aggregates(db, as_of, window_days)
-    members = db.scalars(select(Member)).all()
-    if not members:
-        raise AppError("VALIDATION", 409, {"reason": "会员表为空，无法重算分群"})
-    payload = []
-    for member in members:
-        count, amount, latest = aggregates.get(member.id, (0, 0.0, None))
-        payload.append(
-            {
-                "id": member.id,
-                "member_no": member.member_no,
-                "last_order_on": latest.date() if isinstance(latest, datetime) else None,
-                "orders": count,
-                "amount": amount,
-                "purchase_rate": member.purchase_rate,
-                "avg_ticket": member.avg_ticket,
-            }
-        )
-    result = rfm_service.compute(payload, as_of=as_of, weights=weights, window_days=window_days)
-    snapshot = {
-        "weights": list(weights),
-        "window_days": window_days,
-        "thresholds": result["thresholds"],
-        "global_purchase_rate": result["global_purchase_rate"],
-        "as_of": result["as_of"],
-        "members": result["totals"]["members"],
-        "orders": result["totals"]["orders"],
-        "tail_factor": DEFAULT_TAIL_FACTOR,
-    }
-    rfm_service.persist(db, result, window_days=window_days, as_of=as_of, snapshot=snapshot)
-    result["members"] = []
-    result["member_count"] = len(payload)
-    return result
+    """重算落到独立批次（不覆盖线上口径）；确认后由 `activate` 一次性切换。"""
+    return rfm_batch_service.recompute(
+        db,
+        weights=weights,
+        window_days=window_days,
+        trigger=trigger,
+        actor=actor,
+        note=note,
+    )
 
 
-def segments_for_allocation(db: Session) -> list[dict]:
-    """供算法 B 使用：只取启用且有人的分群。"""
+def activate_batch(db: Session, batch_id: int, *, actor: str) -> dict:
+    batch = rfm_batch_service.get_batch(db, batch_id)
+    return rfm_batch_service.activate(db, batch, actor=actor)
+
+
+def list_batches(db: Session, limit: int = 30) -> dict:
+    return rfm_batch_service.list_batches(db, limit=limit)
+
+
+def batch_detail(db: Session, batch_id: int) -> dict:
+    return rfm_batch_service.batch_detail(db, rfm_batch_service.get_batch(db, batch_id))
+
+
+def resume_batch(db: Session, batch_id: int) -> dict:
+    return rfm_batch_service.resume(db, rfm_batch_service.get_batch(db, batch_id))
+
+
+def segments_for_allocation(db: Session, batch: RfmBatch | None = None) -> list[dict]:
+    """供算法 B 使用：优先读指定批次的八类汇总，券口径仍取线上运营配置。"""
+    if batch is not None:
+        overrides = {row.code: row for row in db.scalars(select(Segment)).all()}
+        rows = rfm_batch_service.batch_segments(db, batch.id)
+        result = []
+        for row in rows:
+            live = overrides.get(row.code)
+            if live is not None and not live.enabled:
+                continue
+            result.append(
+                {
+                    "code": row.code,
+                    "name": row.name,
+                    "member_count": row.member_count,
+                    "purchase_rate": row.purchase_rate,
+                    "coupon_face": (live.coupon_face if live is not None else 0.0),
+                    "core_share": (live.core_share if live is not None else 0.6),
+                    "avg_ticket": row.avg_ticket,
+                }
+            )
+        return [item for item in result if item["member_count"] > 0]
     rows = db.scalars(select(Segment).where(Segment.enabled.is_(True)).order_by(Segment.sort_order)).all()
     return [
         {

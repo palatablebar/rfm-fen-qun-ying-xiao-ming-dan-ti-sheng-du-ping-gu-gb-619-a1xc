@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { ENUMS, can, liftTone, segmentTone } from '../config.js';
+import { ENUMS, batchTone, can, liftTone, segmentTone } from '../config.js';
 import {
   badge,
   drawer,
@@ -98,8 +98,10 @@ async function openSegment(view, ctx, segment) {
 export const segmentsPage = {
   async render(view, ctx) {
     let data;
+    let batches;
     try {
-      data = await api.get('/api/segments');
+      [data] = await Promise.all([api.get('/api/segments')]);
+      batches = await api.get('/api/segments/batches', { limit: 20 });
     } catch (err) {
       view.innerHTML = errorBox(errorMessage(err));
       view.querySelector('#retry-btn')?.addEventListener('click', () => segmentsPage.render(view, ctx));
@@ -186,6 +188,8 @@ export const segmentsPage = {
         })}
       </section>
 
+      ${batchPanel(batches, data, admin)}
+
       <section class="panel">
         <div class="panel-head"><h2>怎么读这张表</h2><span class="meta">口径说明</span></div>
         <div class="panel-body note">
@@ -218,7 +222,10 @@ export const segmentsPage = {
           (best, item) => ((item.lift || 0) > (best.lift || 0) ? item : best),
           { lift: 0, name: '—' },
         );
-        toast(`重算完成：${result.member_count} 人，最高 ${topSegment.name} lift ${Number(topSegment.lift).toFixed(2)}`);
+        const verb = result.created ? '已生成候选批次' : '同水位权重已复用批次';
+        toast(
+          `${verb} ${result.batch_no}：${fmtNum(result.member_count)} 人，最高 ${topSegment.name} lift ${Number(topSegment.lift).toFixed(2)}。线上口径未变，核对后切换。`,
+        );
         await segmentsPage.render(view, ctx);
       } catch (err) {
         toast(errorMessage(err), 'err');
@@ -226,6 +233,7 @@ export const segmentsPage = {
         button.textContent = '重算分群';
       }
     });
+    bindBatchActions(view, ctx, batches);
     view.querySelectorAll('table.data tbody tr').forEach((row) => {
       row.addEventListener('click', () => {
         const item = data.items.find((entry) => String(entry.id) === row.dataset.id);
@@ -234,5 +242,174 @@ export const segmentsPage = {
     });
   },
 };
+
+function batchPanel(batches, data, admin) {
+  const items = batches.items || [];
+  const activeNo = batches.active_batch_no;
+  const candidates = items.filter((item) => item.status === 'ready');
+  const rows = items
+    .map(
+      (item) => `<tr data-batch="${esc(item.id)}">
+        <td class="mono">${esc(item.batch_no)}
+          ${item.is_active ? ' ' + badge('ok', '正式') : item.status === 'ready' ? ' ' + badge('pending warn', '候选') : ''}
+        </td>
+        <td>${badge(batchTone(item.status), item.status_label || ENUMS.batchStatus[item.status] || item.status)}</td>
+        <td class="num">${fmtNum(item.member_count)}</td>
+        <td class="num">${fmtPct(item.global_purchase_rate)}</td>
+        <td class="mono">${(item.weights || []).map((w) => Number(w).toFixed(1)).join('/')} · ${item.window_days}天</td>
+        <td class="mono">${esc(item.watermark.orders)} 单#${esc(item.watermark.max_order_id ?? '—')}</td>
+        <td class="mono">${esc((item.created_at || '').slice(0, 16).replace('T', ' '))}</td>
+      </tr>`,
+    )
+    .join('');
+  return `<section class="panel" data-testid="batch-panel">
+    <div class="panel-head">
+      <h2>重算批次</h2>
+      <span class="meta">正式 ${esc(activeNo || '—')} · 候选 ${candidates.length} 个 · 同一水位权重不新增</span>
+    </div>
+    <div class="panel-body" style="display:grid;gap:12px">
+      <div class="note">
+        重算只产候选批次，不覆盖线上口径。候选批次核对人数与购买率后点「切换为正式口径」，
+        切换失败会整体回滚并保留旧版。名单生成固定引用当时的正式批次号。
+      </div>
+      ${
+        rows
+          ? `<div class="table-wrap"><table class="data" style="min-width:0">
+              <thead><tr><th>批次号</th><th>状态</th><th>人数</th><th>大盘购买率</th><th>口径</th><th>订单水位</th><th>创建</th></tr></thead>
+              <tbody>${rows}</tbody></table></div>`
+          : '<p class="muted">还没有重算批次，点一次「重算分群」即可生成候选。</p>'
+      }
+      ${
+        candidates.length
+          ? `<div class="rule-chipline">
+              ${candidates
+                .map(
+                  (item) =>
+                    `${admin ? `<button class="btn sm accent" data-activate="${esc(item.id)}" data-testid="activate-${esc(item.batch_no)}">切换 ${esc(item.batch_no)}</button>` : ''}
+                    <button class="btn sm ghost" data-diff="${esc(item.id)}">查看 ${esc(item.batch_no)} 差异</button>`,
+                )
+                .join('')}
+            </div>`
+          : ''
+      }
+      ${
+        candidates.length && !admin
+          ? '<div class="note">候选批次需管理员核对后切换；当前角色可以查看差异，但不能切换。</div>'
+          : ''
+      }
+      ${
+        admin && items.some((item) => item.status === 'failed')
+          ? `<div class="rule-chipline">${items
+              .filter((item) => item.status === 'failed')
+              .map(
+                (item) =>
+                  `<button class="btn sm ghost" data-resume="${esc(item.id)}">续跑 ${esc(item.batch_no)}</button>`,
+              )
+              .join('')}</div>`
+          : ''
+      }
+    </div>
+  </section>`;
+}
+
+function diffDrawer(htmlTitle, diff) {
+  if (!diff) {
+    return drawer({
+      title: htmlTitle,
+      subtitle: '候选批次差异',
+      body: '<p class="muted">还没有可比对的线上口径。</p>',
+    });
+  }
+  const rows = diff.segments
+    .map(
+      (row) => `<tr>
+        <td>${esc(row.name)}<div class="mono muted">${esc(row.code)}</div></td>
+        <td class="num">${fmtNum(row.current_member_count)}</td>
+        <td class="num">${fmtNum(row.candidate_member_count)}</td>
+        <td class="num" style="color:${row.member_count_delta ? 'var(--warn)' : 'inherit'}">${
+          row.member_count_delta > 0 ? '+' : ''
+        }${fmtNum(row.member_count_delta)}</td>
+        <td class="num">${fmtPct(row.current_purchase_rate)}</td>
+        <td class="num">${fmtPct(row.candidate_purchase_rate)}</td>
+        <td class="num">${fmtLift(row.current_lift)} → ${fmtLift(row.candidate_lift)}</td>
+      </tr>`,
+    )
+    .join('');
+  return drawer({
+    title: htmlTitle,
+    subtitle: `${diff.current_batch_no} → ${diff.candidate_batch_no}`,
+    body: `${kv([
+      ['口径对比', esc(diff.current_batch_no)],
+      ['候选批次', esc(diff.candidate_batch_no)],
+      ['人数', `${fmtNum(diff.current_member_count)} → ${fmtNum(diff.candidate_member_count)}（${diff.member_count_delta > 0 ? '+' : ''}${fmtNum(diff.member_count_delta)}）`],
+      [
+        '大盘购买率',
+        `${diff.current_global_purchase_rate == null ? '—' : fmtPct(diff.current_global_purchase_rate)} → ${fmtPct(diff.candidate_global_purchase_rate)}`,
+      ],
+    ])}
+    <h3 style="margin:14px 0 8px;font-size:0.95rem">逐群差异</h3>
+    <div class="table-wrap"><table class="data" style="min-width:0">
+      <thead><tr><th>分群</th><th>现人数</th><th>候选</th><th>差异</th><th>现购买率</th><th>候选购买率</th><th>lift</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="note" style="margin-top:10px">切换会一次性覆盖八类人数、购买率与 lift；券口径（券面额 / 核心盘占比）沿用运营配置。</div>`,
+    footer: `<button class="btn ghost" data-close>关闭</button>`,
+  });
+}
+
+function bindBatchActions(view, ctx, batches) {
+  view.querySelectorAll('[data-diff]').forEach((node) => {
+    node.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      try {
+        const detail = await api.get(`/api/segments/batches/${node.dataset.diff}`);
+        const { root } = diffDrawer(`批次 ${detail.batch_no} 差异`, detail.diff);
+        root.querySelector('[data-close]')?.addEventListener('click', () => root.remove());
+      } catch (err) {
+        toast(errorMessage(err), 'err');
+      }
+    });
+  });
+  view.querySelectorAll('[data-resume]').forEach((node) => {
+    node.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      try {
+        const result = await api.post(`/api/segments/batches/${node.dataset.resume}/resume`, {});
+        toast(`续跑完成：${result.batch_no} · ${result.status_label}`);
+        await segmentsPage.render(view, ctx);
+      } catch (err) {
+        toast(errorMessage(err), 'err');
+      }
+    });
+  });
+  view.querySelectorAll('[data-activate]').forEach((node) => {
+    node.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const id = node.dataset.activate;
+      let detail;
+      try {
+        detail = await api.get(`/api/segments/batches/${id}`);
+      } catch (err) {
+        toast(errorMessage(err), 'err');
+        return;
+      }
+      const { root } = diffDrawer(`切换批次 ${detail.batch_no}`, detail.diff);
+      const footer = document.createElement('div');
+      footer.className = 'rule-chipline';
+      footer.innerHTML = `<button class="btn accent" data-confirm-switch>确认切换为正式口径</button>
+        <span class="note" style="margin:0">切换失败会保留旧版，不影响已确认名单。</span>`;
+      root.querySelector('.drawer').appendChild(footer);
+      footer.querySelector('[data-confirm-switch]').addEventListener('click', async () => {
+        try {
+          const result = await api.post(`/api/segments/batches/${id}/activate`, {});
+          toast(`已切换为正式口径 ${result.batch.batch_no}（替换 ${result.switched_from || '—'}）`);
+          root.remove();
+          await segmentsPage.render(view, ctx);
+        } catch (err) {
+          toast(errorMessage(err), 'err');
+        }
+      });
+    });
+  });
+}
 
 export default segmentsPage;

@@ -56,6 +56,7 @@ export const overviewPage = {
             F/M 窗口 ${esc(snapshot.window_days || 365)} 天，权重
             ${(snapshot.weights || [0.3, 0.3, 0.4]).map((w) => Number(w).toFixed(1)).join(' / ')}；
             分位阈值 R ${esc(JSON.stringify(snapshot.thresholds?.r || []))}。阈值一改，分群人数与 lift 会整批重算。
+            ${snapshot.batch_no ? `当前正式口径批次 <b class="mono">${esc(snapshot.batch_no)}</b>。` : ''}
           </div>
         </div>
         <div class="hero-side">

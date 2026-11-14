@@ -55,12 +55,14 @@ def members_csv(db: Session) -> bytes:
 
 def segments_csv(db: Session) -> bytes:
     rows = db.scalars(select(Segment).order_by(Segment.sort_order, Segment.id)).all()
+    snapshot = next((row.snapshot for row in rows if row.snapshot), {}) or {}
     headers = [
-        "分群编码", "分群", "规则", "人数", "占比", "平均R分", "平均F分", "平均M分",
+        "批次号", "分群编码", "分群", "规则", "人数", "占比", "平均R分", "平均F分", "平均M分",
         "平均R天数", "人均窗口金额", "购买率", "lift", "券面额", "核心盘占比", "启用",
     ]
     payload = [
         [
+            snapshot.get("batch_no", ""),
             item.code, item.name, item.rule_text, item.member_count, f"{(item.share or 0) * 100:.2f}%",
             f"{item.avg_r_score or 0:.2f}", f"{item.avg_f_score or 0:.2f}", f"{item.avg_m_score or 0:.2f}",
             f"{item.avg_r_days or 0:.1f}", f"{item.avg_amount_window or 0:.2f}",
@@ -80,7 +82,7 @@ def audience_csv(db: Session, audience_id: int | None = None) -> bytes:
     audiences = db.scalars(stmt).all()
     campaigns = {item.id: item for item in db.scalars(select(Campaign)).all()}
     headers = [
-        "名单号", "活动", "名单状态", "分群", "分群lift", "会员号", "姓名", "手机号", "城市",
+        "名单号", "批次号", "活动", "名单状态", "分群", "分群lift", "会员号", "姓名", "手机号", "城市",
         "会员等级", "R分", "F分", "M分", "综合分", "历史券响应率", "该群分到人数", "该群预算",
         "该群预计增量单量", "该群ROI",
     ]
@@ -89,33 +91,73 @@ def audience_csv(db: Session, audience_id: int | None = None) -> bytes:
         campaign = campaigns.get(audience.campaign_id)
         campaign_name = campaign.name if campaign else ""
         status_label = AUDIENCE_STATUS_LABELS.get(audience.status, audience.status)
+        quotas = {
+            row.get("segment_code"): row
+            for row in audience.allocation or []
+            if row.get("status") == "allocated" and row.get("allocated")
+        }
+        frozen = audience.members or []
+        if frozen:
+            # 名单生成时冻结的会员明细：后续重算不改动这份导出
+            for member in frozen:
+                quota = quotas.get(member.get("segment_code"), {})
+                payload.append(_audience_row(audience, campaign_name, status_label, member, quota))
+                if len(payload) >= MAX_EXPORT_ROWS:
+                    return to_csv(headers, payload)
+            continue
+        # 兼容旧名单（无冻结明细）：按当前线上口径展开
         for row in audience.allocation or []:
             if row.get("status") != "allocated" or not row.get("allocated"):
                 continue
-            members = db.scalars(
+            legacy = db.scalars(
                 select(Member)
                 .where(Member.segment_code == row["segment_code"])
                 .order_by(Member.composite_score.desc().nullslast(), Member.id)
                 .limit(int(row["allocated"]))
             ).all()
-            for member in members:
-                payload.append(
-                    [
-                        audience.audience_no, campaign_name, status_label,
-                        SEGMENT_LABELS.get(row["segment_code"], row["segment_code"]),
-                        f"{row.get('lift', 0):.4f}",
-                        member.member_no, member.name, member.phone, member.city,
-                        MEMBER_TIER_LABELS.get(member.tier, member.tier),
-                        member.r_score, member.f_score, member.m_score,
-                        f"{member.composite_score or 0:.2f}",
-                        f"{(member.purchase_rate or 0) * 100:.2f}%",
-                        row.get("allocated", 0), f"{row.get('budget', 0):.2f}",
-                        row.get("inc_orders", 0), f"{row.get('roi', 0):.2f}",
-                    ]
-                )
+            for member in legacy:
+                record = {
+                    "member_no": member.member_no,
+                    "name": member.name,
+                    "phone": member.phone,
+                    "city": member.city,
+                    "tier": member.tier,
+                    "r_score": member.r_score,
+                    "f_score": member.f_score,
+                    "m_score": member.m_score,
+                    "composite_score": member.composite_score,
+                    "purchase_rate": member.purchase_rate,
+                    "segment_code": row["segment_code"],
+                }
+                payload.append(_audience_row(audience, campaign_name, status_label, record, row))
                 if len(payload) >= MAX_EXPORT_ROWS:
                     return to_csv(headers, payload)
     return to_csv(headers, payload)
+
+
+def _audience_row(audience: Audience, campaign_name: str, status_label: str, member: dict, quota: dict) -> list:
+    return [
+        audience.audience_no,
+        audience.batch_no or "",
+        campaign_name,
+        status_label,
+        SEGMENT_LABELS.get(member.get("segment_code"), member.get("segment_code") or ""),
+        f"{quota.get('lift', 0):.4f}",
+        member.get("member_no", ""),
+        member.get("name", ""),
+        member.get("phone", ""),
+        member.get("city", ""),
+        MEMBER_TIER_LABELS.get(member.get("tier"), member.get("tier") or ""),
+        member.get("r_score"),
+        member.get("f_score"),
+        member.get("m_score"),
+        f"{member.get('composite_score') or 0:.2f}",
+        f"{(member.get('purchase_rate') or 0) * 100:.2f}%",
+        quota.get("allocated", 0),
+        f"{quota.get('budget', 0):.2f}",
+        quota.get("inc_orders", 0),
+        f"{quota.get('roi', 0):.2f}",
+    ]
 
 
 def campaigns_csv(db: Session) -> bytes:

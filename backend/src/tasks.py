@@ -8,6 +8,7 @@ from sqlalchemy import select
 from src.config.celery_app import TASK_DAILY, TASK_HEARTBEAT, celery_app
 from src.config.settings import settings
 from src.utils.logger import get_logger
+from src.utils.timeutil import local_now
 
 logger = get_logger("tasks")
 
@@ -35,19 +36,27 @@ def daily_refresh() -> dict:
     from src.services import audit_service, audience_service, segment_service
 
     with session_scope() as db:
-        result = segment_service.recompute(db)
+        # 定时重算只产出候选批次，不覆盖线上口径；切换仍需管理员核对后确认。
+        result = segment_service.recompute(db, trigger="schedule", actor=f"scheduler@{settings.app_name}.io")
         audit_service.record(
             db,
             actor_email=f"scheduler@{settings.app_name}.io",
             actor_role="admin",
             action="segment.recompute",
-            entity="segment",
-            entity_id=None,
-            detail={"as_of": result["as_of"], "members": result["member_count"], "trigger": "schedule"},
+            entity="rfm_batch",
+            entity_id=result["id"],
+            detail={
+                "batch_no": result["batch_no"],
+                "as_of": result["as_of"],
+                "members": result["member_count"],
+                "trigger": "schedule",
+                "reused": result.get("reused", False),
+            },
             layer="worker",
         )
         campaigns = db.scalars(select(Campaign).where(Campaign.status == "active")).all()
         generated = 0
+        today = local_now().strftime("%Y%m%d")
         for campaign in campaigns:
             try:
                 audience_service.generate(
@@ -55,10 +64,17 @@ def daily_refresh() -> dict:
                     campaign=campaign,
                     budget=campaign.budget,
                     operator_email=f"scheduler@{settings.app_name}.io",
-                    note="每日定时重算生成",
+                    note="每日定时重算生成（引用线上正式批次）",
+                    # 同一活动同一天重试不会重复补名单
+                    seed_key=f"scheduled-{campaign.code}-{today}",
                 )
                 generated += 1
             except Exception as exc:  # noqa: BLE001 - 单个活动失败不影响其它
                 logger.warning("audience generate failed for %s: %s", campaign.code, exc)
         logger.info("daily refresh: %s members, %s audiences", result["member_count"], generated)
-        return {"members": result["member_count"], "audiences": generated}
+        return {
+            "batch_no": result["batch_no"],
+            "batch_status": result["status"],
+            "members": result["member_count"],
+            "audiences": generated,
+        }

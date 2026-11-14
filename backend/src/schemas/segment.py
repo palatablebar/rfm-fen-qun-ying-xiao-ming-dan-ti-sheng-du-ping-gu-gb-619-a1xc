@@ -6,12 +6,13 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class RecomputeIn(BaseModel):
-    """算法 A 的可调参数：权重 + 统计窗口。"""
+    """算法 A 的可调参数：权重 + 统计窗口。重算只产候选批次，不直接覆盖线上口径。"""
 
     weight_r: float = Field(default=0.3, ge=0.0, le=1.0)
     weight_f: float = Field(default=0.3, ge=0.0, le=1.0)
     weight_m: float = Field(default=0.4, ge=0.0, le=1.0)
     window_days: int = Field(default=365, ge=30, le=730)
+    trigger: Literal["manual", "schedule", "seed"] | None = "manual"
 
     @field_validator("weight_m")
     @classmethod

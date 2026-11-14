@@ -70,6 +70,7 @@ function historyTable(audiences) {
     rows: audiences,
     columns: [
       { key: 'audience_no', label: '名单号', className: 'mono' },
+      { key: 'batch_no', label: '口径批次', className: 'mono', render: (row) => esc(row.batch_no || '—') },
       { key: 'campaign_name', label: '活动' },
       { key: 'status', label: '状态', render: (row) => badge(audienceTone(row.status), row.status_label) },
       { key: 'member_count', label: '人数', className: 'num', render: (row) => fmtNum(row.member_count) },
@@ -91,6 +92,7 @@ function openAudience(view, ctx, audience, campaigns) {
     subtitle: `${audience.campaign_name || ''} · ${audience.status_label}`,
     body: `${kv([
       ['活动', esc(audience.campaign_name || '—')],
+      ['口径批次', esc(audience.batch_no || '—')],
       ['名单人数', fmtNum(audience.member_count)],
       ['预算 / 实花', `${fmtMoney(audience.budget)} / ${fmtMoney(audience.spend)}`],
       ['预计增量单量', fmtNum(audience.inc_orders)],
@@ -100,6 +102,7 @@ function openAudience(view, ctx, audience, campaigns) {
       ['生成人 / 时间', `${esc(audience.operator_email)} · ${esc((audience.created_at || '').slice(0, 16).replace('T', ' '))}`],
       ['确认人', esc(audience.confirmed_by || '—')],
     ])}
+    <div class="note">名单明细在生成时按批次 ${esc(audience.batch_no || '—')} 冻结；后续重算不会改动本名单与导出明细。</div>
     <h3 style="margin:14px 0 6px;font-size:0.95rem">分群预算分配</h3>
     <div class="table-wrap"><table class="data" style="min-width:0">
       <thead><tr><th>分群</th><th>lift</th><th>人数</th><th>预算</th><th>增量</th><th>ROI</th></tr></thead>
@@ -202,6 +205,7 @@ export const audiencesPage = {
                     allocation.basis.reach_cost,
                   )} + 购买率 × 券面额；按 lift/成本 贪心排序；人均增量单量 ${allocation.basis.orders_per_converter}；
                   超出核心盘部分 ×${allocation.basis.tail_factor} 折减。${esc(allocation.log)}
+                  ${allocation.batch_no ? `<br />当前正式口径批次 <b class="mono">${esc(allocation.batch_no)}</b>：生成名单会固定引用它。` : ''}
                 </div>`
               : ''
           }

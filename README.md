@@ -16,12 +16,13 @@
 - **一天的工作剧本**：
   1. 09:10 门店 POS 日结文件同步完成，订单表新增 3.2 万单（演示库 30,000 单可在 8,000 人抽样上重放）。
   2. 09:20 数据专员打开「RFM 分群」，看到快照日 2026-11-14、大盘购买率 2.81%、八个分群的 lift。
-  3. 09:25 运营管理员把权重从 0.3/0.3/0.4 调到 0.6/0.2/0.2，点「重算分群」：分位切点移动，分群人数随之变化，页面直接给出新阈值。
-  4. 09:40 在「名单与提升度」选「秋日会员日券」，把预算从 1,400 改成 2,000，试算看到哪几个分群被优先分配、哪几个「预算不足」。
-  5. 10:00 点「生成名单」，得到 A2026111401：覆盖 X 人、券预算 Y 元、预计增量 Z 单、整体 ROI R。
-  6. 10:10 数据专员点「确认名单」，管理员在「导出与审计」下载名单明细 CSV，交给券平台。
-  7. 14:00 门店只读角色登录，只能看到脱敏手机号，导出按钮置灰；直接调 `/api/exports/members.csv` 返回 403。
-  8. 次日 07:40 Celery worker 定时重算 RFM 并为进行中活动补一份名单，审计日志留痕。
+  3. 09:25 运营管理员把权重从 0.3/0.3/0.4 调到 0.6/0.2/0.2，点「重算分群」：生成一个独立**候选批次**（不覆盖线上口径），页面列出候选 vs 正式的人数 / 购买率差异。
+  4. 09:30 管理员核对候选批次的八类人数与大盘购买率无误，点「切换为正式口径」：一个事务内整批替换，失败自动回滚保留旧版。
+  5. 09:40 在「名单与提升度」选「秋日会员日券」，把预算从 1,400 改成 2,000，试算看到哪几个分群被优先分配、哪几个「预算不足」。
+  6. 10:00 点「生成名单」，得到 A2026111401：覆盖 X 人、券预算 Y 元、预计增量 Z 单、整体 ROI R；名单固定引用当时的正式批次号与会员明细。
+  7. 10:10 数据专员点「确认名单」，管理员在「导出与审计」下载名单明细 CSV，交给券平台；后续重算不会改动这份明细。
+  8. 14:00 门店只读角色登录，只能看到脱敏手机号，导出按钮置灰；直接调 `/api/exports/members.csv` 返回 403。
+  9. 次日 07:40 Celery worker 定时重算 RFM（只产候选批次）并为进行中活动补一份名单，审计日志留痕。
 
 ## 2. 角色与权限
 
@@ -39,7 +40,7 @@
 | # | 模块 | 对应页面 | 主要 services / controller | 主要 API |
 |---|---|---|---|---|
 | ① | 会员与订单接入 | 会员与订单 `#/members` | `member_service` / `member_controller` | `GET /api/members`、`GET /api/members/{id}`、`GET /api/orders` |
-| ② | RFM 评分（算法 A） | RFM 分群 `#/segments` | `rfm_service`、`segment_service` / `segment_controller` | `POST /api/segments/recompute`、`GET /api/segments` |
+| ② | RFM 评分（算法 A） | RFM 分群 `#/segments` | `rfm_service`、`rfm_batch_service`、`segment_service` / `segment_controller` | `POST /api/segments/recompute`、`GET /api/segments`、`GET /api/segments/batches`、`GET /api/segments/batches/{id}`、`POST /api/segments/batches/{id}/resume`、`POST /api/segments/batches/{id}/activate` |
 | ③ | 分群规则与券口径 | RFM 分群 `#/segments` | `segment_service` / `segment_controller` | `PATCH /api/segments/{id}` |
 | ④ | 名单生成（算法 B 落库） | 名单与提升度 `#/audiences` | `audience_service` / `audience_controller` | `POST /api/audiences`、`GET /api/audiences`、`PATCH /api/audiences/{id}/review` |
 | ⑤ | 提升度与预算分配（算法 B） | 名单与提升度 `#/audiences` | `lift_service`、`audience_service` / `campaign_controller` | `GET /api/campaigns`、`POST /api/campaigns`、`GET /api/campaigns/{id}/allocation` |
@@ -99,6 +100,8 @@ cd frontend/site && python -m http.server 5173
 ```text
 backend/
   src/{config,constants,controllers,middlewares,models,routes,schemas,services,utils}
+  src/models/rfm_batch.py            # 重算批次三张表
+  src/services/rfm_batch_service.py  # 批次建/续跑/核对/切换/名单取人
   scripts/{seed_demo.py,demo_config.py,worker_healthcheck.sh}
   migrations/  tests/
 frontend/
@@ -131,6 +134,33 @@ docker-compose.yml  .env  README.md
 > 为什么默认窗口是 365 天而不是 180 天：R 与 F/M 同窗口时，「最近一次下单在 180 天前」意味着窗口内几乎没有订单，
 > 于是 `重要挽留 / 流失预警`（R 低但 F/M 高）在定义上永远为空。取一年窗口，这三类才有业务含义。
 > 页面与 API 可以把窗口改成 180 天（`window_days=180`），行为可见、可解释。
+
+### 算法 A｜重算批次（`backend/src/services/rfm_batch_service.py`）
+
+重算**不直接覆盖线上口径**。每次重算是一个独立批次，表结构：
+
+- `rfm_batches`：批次头（`batch_no`、指纹、阶段/状态、权重/窗口、订单水位、游标、大盘购买率）。
+- `rfm_batch_members`：批次内会员级评分快照（含姓名/手机号等展示字段，供名单导出冻结）。
+- `rfm_batch_segments`：批次内八类汇总（人数、购买率、lift，与线上 `segments` 同口径）。
+
+规则：
+
+1. **同水位同权重不新增**：批次指纹 `sha256(快照日 + 权重 + 窗口 + 订单水位)`，
+   `batch_no = B<快照日>-<指纹前 10 位>`。同一水位与权重重跑返回已有批次（`reused=true`），不新增行、不重复评分。
+   订单水位 = `(订单行数, 最大 id, 最大支付时间)`；补录或任务重试会移动水位，从而产生新批次。
+2. **失败可从已处理位置续跑**：批次按 `collect → score → aggregate → ready` 推进，
+   每段写游标（`raw_cursor` / `score_cursor`）并逐批提交；失败写 `status=failed` + `error`，
+   `POST /segments/batches/{id}/resume` 从游标继续，已写入的会员快照不会重复插入。
+3. **核对后一次性切换**：`POST /segments/batches/{id}/activate` 在单个事务里先核对
+   「批次人数 == 已评分会员数 == 八类人数之和」且「大盘购买率 == 八类人数加权购买率」，
+   通过后整批覆盖线上 `members` 评分字段与八类汇总。任一核对失败 → 409 且整体回滚，旧版口径保留。
+   旧批次标记 `superseded`，不删除记录。
+4. **名单固定引用生成时的批次**：`audiences.batch_no` / `batch_id` / `members` 在生成时写入；
+   导出明细只读 `audiences.members`，后续重算与切换都不改动已确认名单及其导出 CSV。
+5. **操作区分候选/正式**：`GET /api/segments/batches` 返回 `active_batch_no` 与每个批次的
+   `status`（`running / failed / ready / active / superseded`）；候选批次详情带 `diff`
+   （vs 线上正式口径的逐群人数、购买率、lift 差异），页面据此区分「候选待切换」与「正式口径」。
+6. 定时任务（Celery `daily_refresh`）只产候选批次，不会自动切换线上口径。
 
 ### 算法 B｜提升度与券预算分配（`backend/src/services/lift_service.py`）
 
